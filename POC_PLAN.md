@@ -2,187 +2,203 @@
 
 ## Background: What is a .bok file?
 
-A `.bok` file is a **Microsoft Access (MDB/JetDB) database** used by the Maktaba Shamela
-(المكتبة الشاملة) Islamic library software. Each `.bok` file contains one book with its
+A `.bok` file is a **Microsoft Access (MDB/JetDB) database** used by the legacy Maktaba
+Shamela (المكتبة الشاملة) desktop software. Each `.bok` file contains one book with its
 full text, table of contents, metadata, and footnotes.
 
-### Known internal tables
+### Legacy format (.bok / MDB) — Shamela v3 and earlier
 
 | Table | Purpose | Key columns |
 |-------|---------|-------------|
-| `b_nass` | Page text content | `id`, `nass` (text body), `page`, `part` (volume), `hashi` (footnotes) |
-| `t_title` | Table of contents | `id`, `tit` (heading text), `lvl` (nesting level), `sub` |
-| `Main` | Book metadata | `BkId`, `Bk` (title), `Betaka` (description), `Auth` (author), `AuthInf` |
+| `b<BkId>` | Page text content | `id`, `nass` (text body), `page`, `part` (volume), `hashi` (footnotes) |
+| `t<BkId>` | Table of contents | `id`, `tit` (heading text), `lvl` (nesting level), `sub` |
+| `main` | Book metadata | `bkid`, `bk` (title), `betaka` (description), `auth` (author), `authinf` |
 
-**Note:** Schema varies slightly between Shamela versions and individual books.
-The POC must inspect the actual schema of the sample file.
+Tools: `mdbtools` on Linux, `pypyodbc`, `access_parser` (pure Python).
 
-### Tools for reading .bok on Linux
+### Modern format (.db / SQLite) — Shamela v4
 
-- `mdbtools` — CLI utilities to list tables, dump schema, and export CSV from MDB files
-- `pypyodbc` + MDB ODBC driver — Python DB-API access
-- Existing open-source projects: `mie00/shamela`, `ojuba-org/thawab-lite` on GitHub
+| Table | Purpose | Key columns |
+|-------|---------|-------------|
+| `page` | Page structure | `id`, `part`, `page`, `number`, `services` (text — often empty, stored in Elasticsearch) |
+| `title` | Chapter hierarchy | `id`, `page`, `parent` |
+
+**Important discovery:** Shamela v4 stores page text in **Elasticsearch/Lucene indices**,
+not in the SQLite databases. The `.db` files only contain structure (page numbers, title
+hierarchy). This means v4 databases cannot be used standalone for text extraction.
+
+### Data source used for this POC
+
+Since legacy `.bok` files are hard to obtain programmatically (Cloudflare protection,
+archive.org blocked), this POC uses the **HuggingFace dataset
+`MoMonir/shamela_books_text_full`** which contains pre-extracted text from 7,500+ Shamela
+books in parquet format.
+
+The dataset structure per row:
+`serial_number, category_id, category, book_title, book_id, edition, publisher,
+page_number, volume_number, text, foot_note`
 
 ---
 
-## SECTION 1 — Proposed POC Workflow
+## SECTION 1 — POC Workflow (Implemented)
 
 ```
-Input: one sample .bok file
+Input: HuggingFace parquet shard → raw JSON → parsed JSON → translation segments
 ```
 
-**Step 1 — Inspect raw structure**
-```bash
-cp sample.bok sample.mdb
-mdb-tables sample.mdb          # list all tables
-mdb-schema sample.mdb          # dump full schema with column types
-mdb-export sample.mdb b_nass | head -50   # preview text rows
-mdb-export sample.mdb t_title             # dump TOC
-mdb-export sample.mdb Main                # dump metadata
-```
-Save all raw output to `output/raw/` for manual inspection.
+**Step 1 — Extract raw data**
+Download one parquet shard (~76MB), filter to a single book, save as `output/raw/book_<id>_raw.json`.
 
-**Step 2 — Parse into structured JSON (Python script)**
+**Step 2 — Parse into structured JSON**
 ```
-parse_bok.py sample.bok → output/parsed/book.json
+python3 scripts/parse_book.py output/raw/book_14031_raw.json
+→ output/parsed/book_14031.json
 ```
-The script will:
-1. Open the .bok file via `subprocess` calls to `mdb-export` (simplest, no ODBC config needed)
-2. Read `Main` table → extract metadata
-3. Read `t_title` table → build chapter list
-4. Read `b_nass` table → extract all pages with text, page number, volume, footnotes
-5. Join pages to their chapter headings by matching `id` ranges
-6. Strip or preserve HTML tags in `nass` field (many books use inline HTML)
-7. Write a single JSON file
+The script:
+1. Reads raw JSON rows
+2. Extracts metadata (title, category, edition, publisher)
+3. Builds page list with text, page numbers, volume, footnotes
+4. Strips HTML tags, handles None/string-None from parquet serialization
+5. Computes statistics (total chars, avg chars/page, footnote presence)
 
 **Step 3 — Generate translation-ready segments**
 ```
-segment_book.py output/parsed/book.json → output/segments/
+python3 scripts/segment_book.py output/parsed/book_14031.json
+→ output/segments/book_14031_by_page.jsonl
+→ output/segments/book_14031_by_paragraph.jsonl
+→ output/segments/book_14031_by_chunk.jsonl
 ```
-Split the parsed book into translation units. The POC will generate **three variants** for comparison:
-- `segments_by_page.jsonl` — one segment per page
-- `segments_by_paragraph.jsonl` — split `nass` on `<br>` or `\n` boundaries
-- `segments_by_chunk.jsonl` — fixed token-count chunks (~500 tokens each)
+Three segmentation strategies for comparison:
+- **by_page** — one segment per page (simplest, preserves page references)
+- **by_paragraph** — split on `\n` boundaries (finer, but very variable size)
+- **by_chunk** — fixed ~1500 char chunks with sentence-boundary alignment (most consistent)
 
 **Step 4 — Inspect and compare**
-Manually review the three segmentation approaches to decide which produces the
-best translation units (coherent context, reasonable length for GPT).
+Review the three approaches to decide which produces the best translation units.
 
 ---
 
-## SECTION 2 — Example Output Structure
+## SECTION 2 — Actual Output Structure (from real data)
 
-### Book metadata (`book.json` top-level)
+### Book metadata
 ```json
 {
-  "book_id": 12345,
-  "title": "كتاب التوحيد",
-  "author": "محمد بن عبد الوهاب",
-  "author_info": "...",
-  "description": "...",
-  "total_pages": 230,
+  "book_id": "14031",
+  "title": "آثار حجج التوحيد في مؤاخذة العبيد",
+  "category": "العقيدة",
+  "category_id": "1",
+  "edition": "الأولى، 1416 هـ - 1995 م",
+  "publisher": "دار الكتاب والسنة، كراتشي - باكستان",
+  "total_pages": 219,
   "total_volumes": 1,
-  "chapters": [ ... ],
-  "pages": [ ... ]
-}
-```
-
-### One chapter entry
-```json
-{
-  "id": 5,
-  "title": "باب فضل التوحيد وما يكفر من الذنوب",
-  "level": 1,
-  "parent_id": null
+  "total_chars": 264835,
+  "avg_chars_per_page": 1209,
+  "has_footnotes": true
 }
 ```
 
 ### One page entry
 ```json
 {
-  "id": 42,
-  "volume": 1,
-  "page_number": 38,
-  "chapter_id": 5,
-  "text_raw": "<p>وعن أبي هريرة رضي الله عنه...</p>",
-  "text_plain": "وعن أبي هريرة رضي الله عنه...",
-  "footnotes": "رواه البخاري ومسلم"
+  "serial_number": "72564",
+  "volume": "1",
+  "page_number": "8",
+  "text_raw": "ولوازمها، والتي حرم عليها مجاوزة محلها...",
+  "text_plain": "ولوازمها، والتي حرم عليها مجاوزة محلها...",
+  "footnotes": "(1) أخرجه الإمام أحمد في مسنده (2/ 161، 191) والإمام مسلم في صحيحه...",
+  "char_count": 1209
 }
 ```
 
-### One translation segment (`segments_by_page.jsonl`)
+### One translation segment (by_page)
 ```json
 {
-  "segment_id": "book_12345_p42",
-  "book_id": 12345,
-  "volume": 1,
-  "page_number": 38,
-  "chapter_title": "باب فضل التوحيد وما يكفر من الذنوب",
-  "source_text": "وعن أبي هريرة رضي الله عنه...",
-  "footnotes": "رواه البخاري ومسلم",
-  "char_count": 412
+  "segment_id": "book_14031_v1_p8",
+  "book_id": "14031",
+  "book_title": "آثار حجج التوحيد في مؤاخذة العبيد",
+  "volume": "1",
+  "page_number": "8",
+  "source_text": "ولوازمها، والتي حرم عليها مجاوزة محلها...",
+  "footnotes": "(1) أخرجه الإمام أحمد في مسنده...",
+  "char_count": 1209
 }
 ```
 
 ---
 
-## SECTION 3 — Minimal Folder Layout
+## SECTION 3 — Folder Layout (Implemented)
 
 ```
 bok-poc/
-├── input/
-│   └── sample.bok              # one sample book (gitignored, stored in cloud)
+├── input/                      # sample databases (gitignored)
+│   ├── 1000.db                 # Shamela v4 SQLite (structure only, no text)
+│   └── 11430.db                # Shamela v4 SQLite (structure only, no text)
 ├── scripts/
-│   ├── inspect_bok.sh          # Step 1: raw mdbtools inspection
-│   ├── parse_bok.py            # Step 2: .bok → structured JSON
-│   └── segment_book.py         # Step 3: JSON → translation segments
+│   ├── parse_book.py           # raw JSON → structured book JSON
+│   └── segment_book.py         # book JSON → translation segments (3 strategies)
 ├── output/
-│   ├── raw/                    # mdb-export CSV dumps, schema dump
+│   ├── raw/                    # per-book raw JSON from HuggingFace
+│   │   ├── book_6488_raw.json  # 30 pages, no footnotes
+│   │   ├── book_8585_raw.json  # 147 pages
+│   │   └── book_14031_raw.json # 219 pages, footnotes on every page
 │   ├── parsed/
-│   │   └── book.json           # full structured book
+│   │   ├── book_6488.json
+│   │   ├── book_8585.json
+│   │   └── book_14031.json
 │   └── segments/
-│       ├── segments_by_page.jsonl
-│       ├── segments_by_paragraph.jsonl
-│       └── segments_by_chunk.jsonl
-├── POC_PLAN.md                 # this file
-├── requirements.txt            # pypyodbc (optional), etc.
-└── .gitignore                  # ignore input/*.bok, output/
+│       ├── book_*_by_page.jsonl
+│       ├── book_*_by_paragraph.jsonl
+│       └── book_*_by_chunk.jsonl
+├── POC_PLAN.md
+└── .gitignore
 ```
 
 ---
 
-## SECTION 4 — Unknowns the POC Will Resolve
+## SECTION 4 — Findings and Remaining Unknowns
 
-| # | Question | How the POC answers it |
-|---|----------|----------------------|
-| 1 | Is `mdb-export` reliable enough, or do we need ODBC? | Run it on the sample file and check for encoding issues or missing data |
-| 2 | What encoding is the Arabic text in? | Inspect raw CSV output — likely Windows-1256 or UTF-8 |
-| 3 | Does `nass` contain HTML, plain text, or mixed? | Dump a few rows and visually inspect |
-| 4 | How are footnotes stored — inline in `nass` or in `hashi` column? | Check if `hashi` column exists and has data |
-| 5 | How do page IDs map to chapter IDs in `t_title`? | Cross-reference `b_nass.id` ranges with `t_title.id` |
-| 6 | Are all tables present in every .bok file? | `mdb-tables` will reveal this immediately |
-| 7 | What is the right translation unit size for GPT? | Compare the three segmentation strategies on real text |
-| 8 | Does the text have diacritics (tashkeel) that affect translation? | Inspect sample pages |
-| 9 | Are there embedded images or non-text content? | Schema and data inspection will reveal this |
-| 10 | How large is a typical parsed book in JSON? | Measure output file size |
+### Resolved by this POC
+
+| # | Question | Answer |
+|---|----------|--------|
+| 1 | What format does Shamela v4 use? | SQLite databases, but text is in Elasticsearch — not self-contained |
+| 2 | Can we get structured text without the Shamela app? | Yes, via HuggingFace dataset `MoMonir/shamela_books_text_full` (7,500+ books) |
+| 3 | What fields exist per page? | serial_number, volume, page_number, text, foot_note |
+| 4 | How are footnotes stored? | Separate `foot_note` field per page (not inline) |
+| 5 | Is the text plain or HTML? | Mostly plain text with occasional `\n` for paragraph breaks |
+| 6 | What is the average page size? | ~800-1200 chars (varies by book) |
+| 7 | Are there chapter headings? | Not in the HuggingFace dataset — would need v4 title tables or legacy .bok |
+
+### Still unknown
+
+| # | Question | How to resolve |
+|---|----------|---------------|
+| 1 | Can we access legacy .bok files at scale? | Download Shamela v3 ISO from archive.org (when accessible) |
+| 2 | Does the HuggingFace dataset cover all books we need? | Cross-reference with master.db catalog (7,542 books in v4) |
+| 3 | What is the optimal translation unit for GPT? | Test 5-10 segments from each strategy with actual API calls |
+| 4 | How should footnotes be handled in translation? | Test inline vs separate translation |
+| 5 | Are there multi-volume books that need special handling? | Find and test a multi-volume book |
+| 6 | Do special Unicode chars (﷽, ﵀, etc.) need preprocessing? | See mapping rules in `ragaeeb/shamela` constants |
 
 ---
 
-## SECTION 5 — Recommended Next Step After Running the POC
+## SECTION 5 — Recommended Next Steps
 
-After inspecting the output from one sample book:
+1. **Test GPT translation** — Send 5-10 page segments and 5-10 chunk segments to the
+   OpenAI API. Compare quality and cost. This determines:
+   - Cost per book (~265K chars ≈ ~66K tokens for book_14031)
+   - Whether footnotes should be translated inline or separately
+   - Whether page-level or chunk-level produces better translations
 
-1. **Decide on segmentation strategy** — Pick page-level, paragraph-level, or chunk-level
-   based on which produces coherent, consistently-sized translation units.
+2. **Handle special characters** — Implement the character mapping rules from
+   `ragaeeb/shamela` (e.g. ﷽ → بِسْمِ اللَّهِ الرَّحْمَنِ الرَّحِيمِ) as a
+   preprocessing step before translation.
 
-2. **Test one GPT translation call** — Send 5-10 segments to the OpenAI API with a
-   simple system prompt. Evaluate translation quality and token usage. This answers:
-   - Cost per page/book
-   - Whether footnotes should be translated separately or inline
-   - Whether chapter titles need special handling
+3. **Add chapter structure** — Either parse legacy .bok files for `t_title` data, or
+   use the v4 `title` table to add chapter headings to the output.
 
-3. **Validate on a second book** — Pick a book with different characteristics (multi-volume,
-   heavy footnotes, or poetry) to confirm the parser handles schema variations.
+4. **Validate at scale** — Run the pipeline on 10+ books of varying sizes and categories
+   to confirm robustness.
 
-4. **Only then** design the full pipeline (batch processing, cloud storage layout,
-   static site generation).
+5. **Only then** design the full production pipeline (batch translation, cloud storage
+   layout, static site generation).
